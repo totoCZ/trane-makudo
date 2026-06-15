@@ -8,9 +8,9 @@ Reversed from Qunda and original remote (it's the same thing).
 
 # AC IR Protocol — Reverse Engineered
 
-Reverse-engineered IR protocol for a **Qunda / compatible split AC unit**, captured via a **Tuya Zigbee IR blaster** (ZS06/ZS08/TS1201 family) and decoded from scratch.
+Reverse-engineered IR protocol for a **Trane / compatible split AC unit**, captured via a **Tuya Zigbee IR blaster** (ZS06/ZS08/TS1201 family) and decoded from scratch.
 
-> Two remotes were tested (Qunda and original). They produce **identical IR frames** — one remote is enough for all captures.
+> Two remotes were tested (Qunda and original brand). They produce **identical IR frames** — one remote is enough for all captures.
 
 ---
 
@@ -159,8 +159,6 @@ Confirmed across all 12 captured samples. **100% reliable.**
 
 ## Captures Used
 
-All from the same AC unit, two different OEM remotes (Qunda + original). Trane remote uses a different B0 byte (`0x60`) and different B5 values — treated as a separate device.
-
 ```
 Remote A / B (identical protocol):
   23°C cool auto, 24°C cool auto
@@ -170,3 +168,47 @@ Remote A / B (identical protocol):
   25°C dry auto, 25°C dry high
   26°C cool low, 26°C dry auto
 ```
+
+---
+
+## Economy Mode
+
+Economy mode uses a separate encoding — **not** the B1 mode/fan table.
+
+```
+Frame: [B0][B1][00][00][00][B5][B6][B7]
+```
+
+| Byte | Value | Notes |
+|------|-------|-------|
+| **B0** | `0x78` | Same as always |
+| **B1** | `0x40 \| (temp - 15)` | B1hi always `4` (cool base), B1lo = temp nibble |
+| **B6** | `0x27` | Fixed. Hi nibble `2` = economy flag. Lo nibble `7` = auto fan field (AC forces low internally) |
+| **B7** | `0x02` (sweep on) / `0x06` (sweep off) | Bit 2 toggles louver. Irrelevant for ducted units. |
+| **B5** | nibsum filler | Same formula: `nibsum(all bytes) = 47` |
+
+Economy mode is always cooling. The AC enforces quiet/low-power fan internally regardless of the fan field.
+
+---
+
+## B5 Formula (updated)
+
+```python
+needed = target - nibsum(B0) - nibsum(B1) - nibsum(B6) - nibsum(B7)
+B5_lo  = 5 if needed >= 5 else needed   # prefer lo=5
+B5_hi  = needed - B5_lo
+B5     = (B5_hi << 4) | B5_lo
+```
+
+When `needed < 5` (rare — only seen in economy+sweep_off), the remote uses a different split. The AC only verifies the total nibble sum, so any valid split works.
+
+---
+
+## Captures Used (updated)
+
+```
+23°C economy, 25°C economy, 25°C economy sweep-off
+25°C dry fan-high (confirms dry formula)
+```
+
+Total: 18 unique captures across 3 remotes and all major modes.
