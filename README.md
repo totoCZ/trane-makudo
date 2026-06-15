@@ -35,7 +35,7 @@ NEC-derived pulse/space encoding at 38 kHz carrier.
 
 Bits are transmitted **MSB first**. No repeat frame is used.
 
-> **Relation to known protocols:** Timing is within ~1–2% of the `CarrierAc64` protocol in IRremoteESP8266 (header ~8940/4556, bit mark 503 µs). Both use 8-byte payloads and nibble-sum checksums, suggesting a shared OEM ASIC lineage — consistent with Carrier and Trane sharing a parent company (Trane Technologies). The payload layout differs, so this is a distinct protocol.
+> **Relation to known protocols:** Timing is within ~1–2% of the `CarrierAc64` protocol in IRremoteESP8266 (header ~8940/4556, bit mark 503 µs).  Both use 8-byte payloads and nibble-sum checksums. This is likely convergent design — both sourcing IR receiver ASICs from the same small pool of Chinese OEM chip suppliers. The payload layout differs, so this is a distinct protocol.
 
 -----
 
