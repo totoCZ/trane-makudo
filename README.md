@@ -14,7 +14,7 @@ Reverse-engineered from Tuya Zigbee IR blaster captures. Implemented in `ac_ir_g
 
 ## Hardware Context
 
-The Trane MCD/MCX cassette units sold in Southeast Asian and Eastern European markets use a **generic OEM control board** (Trane part `690428650001`, cross-compatible with `024-1821` / `024-1491`) possibly sourced from a Chinese OEM supplier — most likely Qunda or AUX family. The board carries a custom IR receiver ASIC with its own firmware; Trane does not publish the protocol. This document describes what was learned by capturing and reverse-engineering the signals.
+The Trane MCD/MCX cassette units sold in Southeast Asian markets use a **generic OEM control board** (Trane part `690428650001`, cross-compatible with `024-1821` / `024-1491`) possibly sourced from a Chinese OEM supplier — most likely Qunda or AUX family. The board carries a custom IR receiver ASIC with its own firmware; Trane does not publish the protocol. This document describes what was learned by capturing and reverse-engineering the signals.
 
 The 024-1064 wireless remote is the standard handheld controller for this board family.
 
