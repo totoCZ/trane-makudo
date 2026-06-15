@@ -57,13 +57,13 @@ input_select:
 
   ac_living_fan:
     name: "AC Living Room — Fan Speed"
-    options: [auto, high, mid, low]
+    options: [auto, high, medium, low]
     initial: auto
     icon: mdi:fan
 
   ac_bedroom_fan:
     name: "AC Bedroom — Fan Speed"
-    options: [auto, high, mid, low]
+    options: [auto, high, medium, low]
     initial: auto
     icon: mdi:fan
 
@@ -90,7 +90,7 @@ mqtt:
     - name: "Living Room AC"
       unique_id: ac_living_room
       modes: ["off", "cool", "fan_only", "dry"]
-      fan_modes: ["auto", "high", "mid", "low"]
+      fan_modes: ["auto", "high", "medium", "low"]
       min_temp: 16
       max_temp: 30
       temp_step: 1
@@ -109,7 +109,7 @@ mqtt:
     - name: "Bedroom AC"
       unique_id: ac_bedroom
       modes: ["off", "cool", "fan_only", "dry"]
-      fan_modes: ["auto", "high", "mid", "low"]
+      fan_modes: ["auto", "high", "medium", "low"]
       min_temp: 16
       max_temp: 30
       temp_step: 1
