@@ -1,0 +1,229 @@
+"""
+ac_pyscript_ha.py — AC IR Code Generator for Home Assistant pyscript
+=====================================================================
+
+Place this file in:  <HA config>/pyscript/ac_ir_generator.py
+
+Services registered:
+  pyscript.ac_send_command    — full control
+  pyscript.ac_turn_off        — power off (keeps last settings)
+  pyscript.ac_set_temperature — change temp only
+  pyscript.ac_set_mode        — change mode only
+  pyscript.ac_set_fan         — change fan speed only
+
+SERVICE CALL EXAMPLE:
+    service: pyscript.ac_send_command
+    data:
+      temp: 24
+      mode: cool      # cool | fan | dry | heat | economy
+      fan: auto       # auto | high | mid | low
+      power: on       # on | off
+      sweep: true     # louver, wall units only
+
+CONFIGURATION: edit IR_BLASTER_TOPIC below.
+"""
+
+import base64
+import struct
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+IR_BLASTER_TOPIC = "zigbee2mqtt/ac_ir_blaster/set"
+TEMP_MIN = 16
+TEMP_MAX = 30
+
+# ── Protocol constants ────────────────────────────────────────────────────────
+
+HEADER_MARK  = 9000
+HEADER_SPACE = 4500
+BIT_MARK     = 576
+ZERO_SPACE   = 576
+ONE_SPACE    = 1662
+FINAL_MARK   = 576
+
+B0_ON  = 0x68   # power ON  (B0 lo nibble = 8)
+B0_OFF = 0x60   # power OFF (B0 lo nibble = 0)
+
+MODE_FAN_NIBBLE = {
+    ("fan",  "auto"): 0x0, ("fan",  "high"): 0x1,
+    ("fan",  "mid"):  0x2, ("fan",  "low"):  0x3,
+    ("cool", "auto"): 0x4, ("cool", "high"): 0x5,
+    ("cool", "mid"):  0x6, ("cool", "low"):  0x7,
+    ("dry",  "auto"): 0x8, ("dry",  "high"): 0x9,
+    ("dry",  "mid"):  0xA, ("dry",  "low"):  0xB,
+    ("heat", "auto"): 0xC, ("heat", "high"): 0xD,
+    ("heat", "mid"):  0xE, ("heat", "low"):  0xF,
+}
+
+FAN_B6 = {"auto": 0x07, "high": 0x02, "mid": 0x01, "low": 0x00}
+
+# ── Core generator ────────────────────────────────────────────────────────────
+
+def _nibsum(b):
+    return (b >> 4) + (b & 0x0F)
+
+def _compute_b5(b0, b1, b6, b7, target):
+    needed = target - _nibsum(b0) - _nibsum(b1) - _nibsum(b6) - _nibsum(b7)
+    if not (0 <= needed <= 30):
+        raise ValueError(f"Cannot satisfy nibsum={target}: needed={needed}")
+    b5_lo = 5 if needed >= 5 else needed
+    return ((needed - b5_lo) << 4) | b5_lo
+
+def _make_payload(temp_c, mode, fan, power="on", sweep=True):
+    b0 = B0_ON if power == "on" else B0_OFF
+    if mode == "economy":
+        b1 = 0x40 | (temp_c - 15)
+        b6 = 0x27
+        b7 = 0x02 if sweep else 0x06
+        target = 47
+    else:
+        key = (mode, fan)
+        if key not in MODE_FAN_NIBBLE:
+            raise ValueError(f"Unknown mode/fan: {mode}/{fan}")
+        b1 = (MODE_FAN_NIBBLE[key] << 4) | (temp_c - 15)
+        b6 = FAN_B6[fan]
+        b7 = 0x0B - b6
+        target = 63 if mode == "dry" else 47
+    b5 = _compute_b5(b0, b1, b6, b7, target)
+    return [b0, b1, 0, 0, 0, b5, b6, b7]
+
+def _payload_to_durations(payload):
+    d = [HEADER_MARK, HEADER_SPACE]
+    for byte in payload:
+        for idx in range(8):
+            bit = (byte >> (7 - idx)) & 1
+            d.append(BIT_MARK)
+            d.append(ONE_SPACE if bit else ZERO_SPACE)
+    d.append(FINAL_MARK)
+    return d
+
+def _fastlz1_compress(data):
+    data = bytes(data); out = bytearray(); i = 0; n = len(data)
+    while i < n:
+        best_len = 0; best_off = 0; ws = max(0, i - 8192)
+        for j in range(ws, i):
+            ml = 0
+            while i+ml < n and ml < 264 and j+ml < i and data[j+ml] == data[i+ml]:
+                ml += 1
+            if ml >= 3 and ml > best_len:
+                best_len, best_off = ml, i - j - 1
+        if best_len >= 3:
+            ln = best_len - 2
+            out.append(((min(ln, 7)) << 5) | (best_off >> 8))
+            if ln >= 7: out.append(ln - 7)
+            out.append(best_off & 0xFF); i += best_len
+        else:
+            rs = i; rl = 0
+            while rl < 32 and i < n:
+                found = False
+                for j in range(max(0, i - 8192), i):
+                    ml = 0
+                    while i+ml < n and ml < 264 and j+ml < i and data[j+ml] == data[i+ml]:
+                        ml += 1
+                    if ml >= 3: found = True; break
+                if found and rl > 0: break
+                rl += 1; i += 1
+            out.append(rl - 1); out.extend(data[rs:rs+rl])
+    return bytes(out)
+
+def make_tuya_code(temp_c, mode="cool", fan="auto", power="on", sweep=True):
+    payload   = _make_payload(temp_c, mode, fan, power, sweep)
+    durations = _payload_to_durations(payload)
+    raw       = struct.pack(f"<{len(durations)}H", *durations)
+    return base64.b64encode(_fastlz1_compress(raw)).decode()
+
+# ── Pyscript services ─────────────────────────────────────────────────────────
+
+@service
+def ac_send_command(temp=25, mode="cool", fan="auto", power="on", sweep=True):
+    """
+    Send a full AC command via the Tuya IR blaster.
+
+    Parameters
+    ----------
+    temp  : int   Temperature °C (16–30).
+    mode  : str   cool | fan | dry | heat | economy
+    fan   : str   auto | high | mid | low  (ignored in economy)
+    power : str   on | off
+    sweep : bool  Louver on/off (wall units only; ducted ignores it).
+    """
+    temp  = int(temp)
+    mode  = str(mode).lower().strip()
+    fan   = str(fan).lower().strip()
+    power = str(power).lower().strip()
+    sweep = bool(sweep)
+
+    if mode in ("fan_only", "fan only"):
+        mode = "fan"
+
+    valid_modes = ("cool", "fan", "dry", "heat", "economy")
+    valid_fans  = ("auto", "high", "mid", "low")
+
+    if not (TEMP_MIN <= temp <= TEMP_MAX):
+        log.error(f"ac_send_command: temp {temp} out of range"); return
+    if mode not in valid_modes:
+        log.error(f"ac_send_command: unknown mode '{mode}'"); return
+    if fan not in valid_fans:
+        log.error(f"ac_send_command: unknown fan '{fan}'"); return
+    if power not in ("on", "off"):
+        log.error(f"ac_send_command: unknown power '{power}'"); return
+
+    try:
+        ir_code = make_tuya_code(temp, mode, fan, power, sweep)
+    except ValueError as e:
+        log.error(f"ac_send_command: {e}"); return
+
+    payload_bytes = _make_payload(temp, mode, fan, power, sweep)
+    log.info(
+        f"ac_send_command: power={power} {temp}°C {mode}/{fan} sweep={sweep} "
+        f"→ [{' '.join(f'{b:02X}' for b in payload_bytes)}]"
+    )
+    mqtt.publish(
+        topic=IR_BLASTER_TOPIC,
+        payload=f'{{"ir_code_to_send":"{ir_code}"}}',
+    )
+
+
+@service
+def ac_turn_off():
+    """
+    Power off the AC, preserving current mode/temp settings on the remote.
+    The AC will remember these settings for the next power-on.
+    """
+    temp = int(float(state.get("input_number.ac_temperature") or 25))
+    mode = state.get("input_select.ac_mode") or "cool"
+    fan  = state.get("input_select.ac_fan_speed") or "auto"
+    ac_send_command(temp=temp, mode=mode, fan=fan, power="off")
+
+
+@service
+def ac_set_temperature(temp=25):
+    """Change temperature, keep current mode/fan."""
+    ac_send_command(
+        temp=temp,
+        mode=state.get("input_select.ac_mode") or "cool",
+        fan=state.get("input_select.ac_fan_speed") or "auto",
+        power="on",
+    )
+
+
+@service
+def ac_set_mode(mode="cool"):
+    """Change mode, keep current temperature/fan."""
+    ac_send_command(
+        temp=int(float(state.get("input_number.ac_temperature") or 25)),
+        mode=mode,
+        fan=state.get("input_select.ac_fan_speed") or "auto",
+        power="on",
+    )
+
+
+@service
+def ac_set_fan(fan="auto"):
+    """Change fan speed, keep current temperature/mode."""
+    ac_send_command(
+        temp=int(float(state.get("input_number.ac_temperature") or 25)),
+        mode=state.get("input_select.ac_mode") or "cool",
+        fan=fan,
+        power="on",
+    )
