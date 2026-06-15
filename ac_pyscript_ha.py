@@ -191,10 +191,8 @@ def ac_send_command(room="living", temp=25, mode="cool", fan="auto", power="on",
         log.error(f"ac_send_command: {e}"); return
 
     payload_bytes = _make_payload(temp, mode, fan, power, sweep)
-    log.info(
-        f"ac_send_command: [{room}] power={power} {temp}°C {mode}/{fan} "
-        f"→ [{' '.join(f'{b:02X}' for b in payload_bytes)}] → {topic}"
-    )
+    hex_bytes = ' '.join([f'{b:02X}' for b in payload_bytes])
+    log.info(f"ac_send_command: [{room}] power={power} {temp}°C {mode}/{fan} → [{hex_bytes}] → {topic}")
     mqtt.publish(topic=topic, payload=f'{{"ir_code_to_send":"{ir_code}"}}')
 
 
