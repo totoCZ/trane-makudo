@@ -2,25 +2,27 @@
 # AC IR Control — Two Rooms — Home Assistant Configuration
 # ============================================================
 #
-# Creates two independent climate entities, each backed by its
-# own Tuya Zigbee IR blaster via Zigbee2MQTT.
+# Architecture:
+#   HA thermostat card
+#     → MQTT climate entity (platform: mqtt)
+#       → command topics  ha/ac/<room>/cmd/<field>
+#         → automation    calls pyscript.ac_handle_cmd
+#           → pyscript    generates IR code → Z2M → IR blaster
+#             → publishes ha/ac/<room>/state  (retained)
+#               → MQTT climate entity updates state
 #
-# ROOMS CONFIGURED:
-#   - Living Room  → Z2M friendly name: ac_ir_blaster_living
-#   - Bedroom      → Z2M friendly name: ac_ir_blaster_bedroom
-#
-# Rename these to match your actual Z2M device names.
-# Also update ac_pyscript_ha.py: IR_BLASTERS dict.
+# input_* helpers act as persistent storage for current settings
+# across HA restarts (pyscript publishes their values on startup).
 #
 # REQUIREMENTS:
 #   - Zigbee2MQTT with both IR blasters paired
-#   - pyscript integration (https://hacs-pyscript.readthedocs.io)
-#   - ac_pyscript_ha.py → <HA config>/pyscript/ac_ir_generator.py
+#   - pyscript integration with allow_all_imports: true
+#   - pyscript/ac_ir_generator.py
 #   - MQTT integration enabled
 # ============================================================
 
 
-# ── Input helpers — one set per room ───────────────────────────
+# ── Input helpers — persistent storage of current settings ─────
 input_number:
   ac_living_temperature:
     name: "AC Living Room — Temperature"
@@ -77,218 +79,124 @@ input_boolean:
     icon: mdi:power
 
 
-# ── Template climate entities ───────────────────────────────────
-template:
-  - climate:
-      # ---- Living Room ----------------------------------------
-      - name: "Living Room AC"
-        unique_id: ac_living_room
-        icon: mdi:air-conditioner
+# ── MQTT climate entities ───────────────────────────────────────
+# These are proper registered HA entities — full thermostat UI,
+# area assignment, history, etc.
+# State is published to retained topics by pyscript on startup
+# and whenever input_* helpers change.
 
-        hvac_mode: >
-          {% if is_state('input_boolean.ac_living_power', 'off') %}off
-          {% elif is_state('input_select.ac_living_mode', 'fan') %}fan_only
-          {% else %}{{ states('input_select.ac_living_mode') }}{% endif %}
+climate:
+  - platform: mqtt
+    name: "Living Room AC"
+    unique_id: ac_living_room
+    modes: ["off", "cool", "fan_only", "dry"]
+    fan_modes: ["auto", "high", "mid", "low"]
+    min_temp: 16
+    max_temp: 30
+    temp_step: 1
+    mode_state_topic: "ha/ac/living/state"
+    mode_state_template: "{{ value_json.mode }}"
+    temperature_state_topic: "ha/ac/living/state"
+    temperature_state_template: "{{ value_json.temperature }}"
+    fan_mode_state_topic: "ha/ac/living/state"
+    fan_mode_state_template: "{{ value_json.fan_mode }}"
+    current_temperature_topic: "ha/ac/living/state"
+    current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
+    mode_command_topic: "ha/ac/living/cmd/mode"
+    temperature_command_topic: "ha/ac/living/cmd/temperature"
+    fan_mode_command_topic: "ha/ac/living/cmd/fan_mode"
 
-        hvac_modes: ["off", "cool", "fan_only", "dry"]
-
-        current_temperature: "{{ states('sensor.living_room_temperature') | float(None) }}"
-        target_temperature:  "{{ states('input_number.ac_living_temperature') | float(25) }}"
-        target_temperature_step: 1
-        min_temp: 16
-        max_temp: 30
-
-        fan_mode:  "{{ states('input_select.ac_living_fan') }}"
-        fan_modes: [auto, high, mid, low]
-
-        set_hvac_mode:
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: "{{ hvac_mode == 'off' }}"
-                sequence:
-                  - action: input_boolean.turn_off
-                    target:
-                      entity_id: input_boolean.ac_living_power
-                  - action: pyscript.ac_send_command
-                    data:
-                      room: living
-                      temp: "{{ states('input_number.ac_living_temperature') | int }}"
-                      mode: "{{ states('input_select.ac_living_mode') }}"
-                      fan:  "{{ states('input_select.ac_living_fan') }}"
-                      power: "off"
-            default:
-              - action: input_boolean.turn_on
-                target:
-                  entity_id: input_boolean.ac_living_power
-              - action: input_select.select_option
-                target:
-                  entity_id: input_select.ac_living_mode
-                data:
-                  option: >
-                    {% if hvac_mode == 'fan_only' %}fan{% else %}{{ hvac_mode }}{% endif %}
-              - action: pyscript.ac_send_command
-                data:
-                  room: living
-                  temp: "{{ states('input_number.ac_living_temperature') | int }}"
-                  mode: >
-                    {% if hvac_mode == 'fan_only' %}fan{% else %}{{ hvac_mode }}{% endif %}
-                  fan:  "{{ states('input_select.ac_living_fan') }}"
-                  power: "on"
-
-        set_temperature:
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.ac_living_temperature
-            data:
-              value: "{{ temperature }}"
-          - condition: state
-            entity_id: input_boolean.ac_living_power
-            state: "on"
-          - action: pyscript.ac_send_command
-            data:
-              room: living
-              temp:  "{{ temperature | int }}"
-              mode:  "{{ states('input_select.ac_living_mode') }}"
-              fan:   "{{ states('input_select.ac_living_fan') }}"
-              power: "on"
-
-        set_fan_mode:
-          - action: input_select.select_option
-            target:
-              entity_id: input_select.ac_living_fan
-            data:
-              option: "{{ fan_mode }}"
-          - condition: state
-            entity_id: input_boolean.ac_living_power
-            state: "on"
-          - action: pyscript.ac_send_command
-            data:
-              room: living
-              temp:  "{{ states('input_number.ac_living_temperature') | int }}"
-              mode:  "{{ states('input_select.ac_living_mode') }}"
-              fan:   "{{ fan_mode }}"
-              power: "on"
-
-      # ---- Bedroom --------------------------------------------
-      - name: "Bedroom AC"
-        unique_id: ac_bedroom
-        icon: mdi:air-conditioner
-
-        hvac_mode: >
-          {% if is_state('input_boolean.ac_bedroom_power', 'off') %}off
-          {% elif is_state('input_select.ac_bedroom_mode', 'fan') %}fan_only
-          {% else %}{{ states('input_select.ac_bedroom_mode') }}{% endif %}
-
-        hvac_modes: ["off", "cool", "fan_only", "dry"]
-
-        current_temperature: "{{ states('sensor.bedroom_temperature') | float(None) }}"
-        target_temperature:  "{{ states('input_number.ac_bedroom_temperature') | float(25) }}"
-        target_temperature_step: 1
-        min_temp: 16
-        max_temp: 30
-
-        fan_mode:  "{{ states('input_select.ac_bedroom_fan') }}"
-        fan_modes: [auto, high, mid, low]
-
-        set_hvac_mode:
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: "{{ hvac_mode == 'off' }}"
-                sequence:
-                  - action: input_boolean.turn_off
-                    target:
-                      entity_id: input_boolean.ac_bedroom_power
-                  - action: pyscript.ac_send_command
-                    data:
-                      room: bedroom
-                      temp: "{{ states('input_number.ac_bedroom_temperature') | int }}"
-                      mode: "{{ states('input_select.ac_bedroom_mode') }}"
-                      fan:  "{{ states('input_select.ac_bedroom_fan') }}"
-                      power: "off"
-            default:
-              - action: input_boolean.turn_on
-                target:
-                  entity_id: input_boolean.ac_bedroom_power
-              - action: input_select.select_option
-                target:
-                  entity_id: input_select.ac_bedroom_mode
-                data:
-                  option: >
-                    {% if hvac_mode == 'fan_only' %}fan{% else %}{{ hvac_mode }}{% endif %}
-              - action: pyscript.ac_send_command
-                data:
-                  room: bedroom
-                  temp: "{{ states('input_number.ac_bedroom_temperature') | int }}"
-                  mode: >
-                    {% if hvac_mode == 'fan_only' %}fan{% else %}{{ hvac_mode }}{% endif %}
-                  fan:  "{{ states('input_select.ac_bedroom_fan') }}"
-                  power: "on"
-
-        set_temperature:
-          - action: input_number.set_value
-            target:
-              entity_id: input_number.ac_bedroom_temperature
-            data:
-              value: "{{ temperature }}"
-          - condition: state
-            entity_id: input_boolean.ac_bedroom_power
-            state: "on"
-          - action: pyscript.ac_send_command
-            data:
-              room: bedroom
-              temp:  "{{ temperature | int }}"
-              mode:  "{{ states('input_select.ac_bedroom_mode') }}"
-              fan:   "{{ states('input_select.ac_bedroom_fan') }}"
-              power: "on"
-
-        set_fan_mode:
-          - action: input_select.select_option
-            target:
-              entity_id: input_select.ac_bedroom_fan
-            data:
-              option: "{{ fan_mode }}"
-          - condition: state
-            entity_id: input_boolean.ac_bedroom_power
-            state: "on"
-          - action: pyscript.ac_send_command
-            data:
-              room: bedroom
-              temp:  "{{ states('input_number.ac_bedroom_temperature') | int }}"
-              mode:  "{{ states('input_select.ac_bedroom_mode') }}"
-              fan:   "{{ fan_mode }}"
-              power: "on"
+  - platform: mqtt
+    name: "Bedroom AC"
+    unique_id: ac_bedroom
+    modes: ["off", "cool", "fan_only", "dry"]
+    fan_modes: ["auto", "high", "mid", "low"]
+    min_temp: 16
+    max_temp: 30
+    temp_step: 1
+    mode_state_topic: "ha/ac/bedroom/state"
+    mode_state_template: "{{ value_json.mode }}"
+    temperature_state_topic: "ha/ac/bedroom/state"
+    temperature_state_template: "{{ value_json.temperature }}"
+    fan_mode_state_topic: "ha/ac/bedroom/state"
+    fan_mode_state_template: "{{ value_json.fan_mode }}"
+    current_temperature_topic: "ha/ac/bedroom/state"
+    current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
+    mode_command_topic: "ha/ac/bedroom/cmd/mode"
+    temperature_command_topic: "ha/ac/bedroom/cmd/temperature"
+    fan_mode_command_topic: "ha/ac/bedroom/cmd/fan_mode"
 
 
-# ── Automations ─────────────────────────────────────────────────
+# ── Automations — bridge MQTT command topics → pyscript ─────────
 automation:
-  - id: ac_living_power_on
-    alias: "AC Living Room — Power On"
+  - id: ac_mqtt_living_mode
+    alias: "AC Living — MQTT mode"
     trigger:
-      - platform: state
-        entity_id: input_boolean.ac_living_power
-        to: "on"
+      - platform: mqtt
+        topic: "ha/ac/living/cmd/mode"
     action:
-      - action: pyscript.ac_send_command
+      - action: pyscript.ac_handle_cmd
         data:
           room: living
-          temp:  "{{ states('input_number.ac_living_temperature') | int }}"
-          mode:  "{{ states('input_select.ac_living_mode') }}"
-          fan:   "{{ states('input_select.ac_living_fan') }}"
-          power: "on"
+          cmd: mode
+          value: "{{ trigger.payload }}"
 
-  - id: ac_bedroom_power_on
-    alias: "AC Bedroom — Power On"
+  - id: ac_mqtt_living_temp
+    alias: "AC Living — MQTT temperature"
     trigger:
-      - platform: state
-        entity_id: input_boolean.ac_bedroom_power
-        to: "on"
+      - platform: mqtt
+        topic: "ha/ac/living/cmd/temperature"
     action:
-      - action: pyscript.ac_send_command
+      - action: pyscript.ac_handle_cmd
+        data:
+          room: living
+          cmd: temperature
+          value: "{{ trigger.payload }}"
+
+  - id: ac_mqtt_living_fan
+    alias: "AC Living — MQTT fan"
+    trigger:
+      - platform: mqtt
+        topic: "ha/ac/living/cmd/fan_mode"
+    action:
+      - action: pyscript.ac_handle_cmd
+        data:
+          room: living
+          cmd: fan_mode
+          value: "{{ trigger.payload }}"
+
+  - id: ac_mqtt_bedroom_mode
+    alias: "AC Bedroom — MQTT mode"
+    trigger:
+      - platform: mqtt
+        topic: "ha/ac/bedroom/cmd/mode"
+    action:
+      - action: pyscript.ac_handle_cmd
         data:
           room: bedroom
-          temp:  "{{ states('input_number.ac_bedroom_temperature') | int }}"
-          mode:  "{{ states('input_select.ac_bedroom_mode') }}"
-          fan:   "{{ states('input_select.ac_bedroom_fan') }}"
-          power: "on"
+          cmd: mode
+          value: "{{ trigger.payload }}"
+
+  - id: ac_mqtt_bedroom_temp
+    alias: "AC Bedroom — MQTT temperature"
+    trigger:
+      - platform: mqtt
+        topic: "ha/ac/bedroom/cmd/temperature"
+    action:
+      - action: pyscript.ac_handle_cmd
+        data:
+          room: bedroom
+          cmd: temperature
+          value: "{{ trigger.payload }}"
+
+  - id: ac_mqtt_bedroom_fan
+    alias: "AC Bedroom — MQTT fan"
+    trigger:
+      - platform: mqtt
+        topic: "ha/ac/bedroom/cmd/fan_mode"
+    action:
+      - action: pyscript.ac_handle_cmd
+        data:
+          room: bedroom
+          cmd: fan_mode
+          value: "{{ trigger.payload }}"
