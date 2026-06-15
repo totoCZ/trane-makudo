@@ -4,23 +4,15 @@ ac_pyscript_ha.py — AC IR Code Generator for Home Assistant pyscript
 
 Place this file in:  <HA config>/pyscript/ac_ir_generator.py
 
-Services registered:
-  pyscript.ac_send_command    — full control
-  pyscript.ac_turn_off        — power off (keeps last settings)
-  pyscript.ac_set_temperature — change temp only
-  pyscript.ac_set_mode        — change mode only
-  pyscript.ac_set_fan         — change fan speed only
+Supports multiple rooms — each with its own Tuya Zigbee IR blaster.
+Add or rename rooms in the IR_BLASTERS dict below.
 
-SERVICE CALL EXAMPLE:
-    service: pyscript.ac_send_command
-    data:
-      temp: 24
-      mode: cool      # cool | fan | dry | heat | economy
-      fan: auto       # auto | high | mid | low
-      power: on       # on | off
-      sweep: true     # louver, wall units only
-
-CONFIGURATION: edit IR_BLASTER_TOPIC below.
+Services:
+  pyscript.ac_send_command(room, temp, mode, fan, power, sweep)
+  pyscript.ac_turn_off(room)
+  pyscript.ac_set_temperature(room, temp)
+  pyscript.ac_set_mode(room, mode)
+  pyscript.ac_set_fan(room, fan)
 """
 
 import base64
@@ -28,7 +20,13 @@ import struct
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-IR_BLASTER_TOPIC = "zigbee2mqtt/ac_ir_blaster/set"
+# Map room name → Zigbee2MQTT friendly name of that room's IR blaster.
+# Add as many rooms as you need.
+IR_BLASTERS = {
+    "living":  "zigbee2mqtt/ac_ir_blaster_living/set",
+    "bedroom": "zigbee2mqtt/ac_ir_blaster_bedroom/set",
+}
+
 TEMP_MIN = 16
 TEMP_MAX = 30
 
@@ -41,8 +39,8 @@ ZERO_SPACE   = 576
 ONE_SPACE    = 1662
 FINAL_MARK   = 576
 
-B0_ON  = 0x68   # power ON  (B0 lo nibble = 8)
-B0_OFF = 0x60   # power OFF (B0 lo nibble = 0)
+B0_ON  = 0x68
+B0_OFF = 0x60
 
 MODE_FAN_NIBBLE = {
     ("fan",  "auto"): 0x0, ("fan",  "high"): 0x1,
@@ -51,8 +49,6 @@ MODE_FAN_NIBBLE = {
     ("cool", "mid"):  0x6, ("cool", "low"):  0x7,
     ("dry",  "auto"): 0x8, ("dry",  "high"): 0x9,
     ("dry",  "mid"):  0xA, ("dry",  "low"):  0xB,
-    ("heat", "auto"): 0xC, ("heat", "high"): 0xD,
-    ("heat", "mid"):  0xE, ("heat", "low"):  0xF,
 }
 
 FAN_B6 = {"auto": 0x07, "high": 0x02, "mid": 0x01, "low": 0x00}
@@ -84,8 +80,7 @@ def _make_payload(temp_c, mode, fan, power="on", sweep=True):
         b6 = FAN_B6[fan]
         b7 = 0x0B - b6
         target = 63 if mode == "dry" else 47
-    b5 = _compute_b5(b0, b1, b6, b7, target)
-    return [b0, b1, 0, 0, 0, b5, b6, b7]
+    return [b0, b1, 0, 0, 0, _compute_b5(b0, b1, b6, b7, target), b6, b7]
 
 def _payload_to_durations(payload):
     d = [HEADER_MARK, HEADER_SPACE]
@@ -126,104 +121,120 @@ def _fastlz1_compress(data):
             out.append(rl - 1); out.extend(data[rs:rs+rl])
     return bytes(out)
 
-def make_tuya_code(temp_c, mode="cool", fan="auto", power="on", sweep=True):
+def _make_tuya_code(temp_c, mode, fan, power="on", sweep=True):
     payload   = _make_payload(temp_c, mode, fan, power, sweep)
     durations = _payload_to_durations(payload)
     raw       = struct.pack(f"<{len(durations)}H", *durations)
     return base64.b64encode(_fastlz1_compress(raw)).decode()
 
+def _get_topic(room):
+    room = str(room).lower().strip()
+    topic = IR_BLASTERS.get(room)
+    if not topic:
+        raise ValueError(
+            f"Unknown room '{room}'. "
+            f"Valid rooms: {list(IR_BLASTERS.keys())}. "
+            f"Add new rooms to IR_BLASTERS in ac_pyscript_ha.py."
+        )
+    return topic
+
+def _state_input(room, entity_type, entity_name, fallback):
+    """Read an input_* helper scoped to a room, e.g. input_number.ac_living_temperature"""
+    entity_id = f"{entity_type}.ac_{room}_{entity_name}"
+    val = state.get(entity_id)
+    return val if val is not None else fallback
+
 # ── Pyscript services ─────────────────────────────────────────────────────────
 
 @service
-def ac_send_command(temp=25, mode="cool", fan="auto", power="on", sweep=True):
+def ac_send_command(room="living", temp=25, mode="cool", fan="auto", power="on", sweep=True):
     """
-    Send a full AC command via the Tuya IR blaster.
+    Send a full AC command to a specific room's IR blaster.
 
     Parameters
     ----------
+    room  : str   Room name — must match a key in IR_BLASTERS.
     temp  : int   Temperature °C (16–30).
-    mode  : str   cool | fan | dry | heat | economy
-    fan   : str   auto | high | mid | low  (ignored in economy)
+    mode  : str   cool | fan | dry | economy
+    fan   : str   auto | high | mid | low
     power : str   on | off
-    sweep : bool  Louver on/off (wall units only; ducted ignores it).
+    sweep : bool  Louver flag (wall units only; ducted ignores it).
     """
+    room  = str(room).lower().strip()
     temp  = int(temp)
     mode  = str(mode).lower().strip()
     fan   = str(fan).lower().strip()
     power = str(power).lower().strip()
     sweep = bool(sweep)
 
-    if mode in ("fan_only", "fan only"):
+    if mode == "fan_only":
         mode = "fan"
 
-    valid_modes = ("cool", "fan", "dry", "heat", "economy")
-    valid_fans  = ("auto", "high", "mid", "low")
+    # Validate
+    try:
+        topic = _get_topic(room)
+    except ValueError as e:
+        log.error(f"ac_send_command: {e}"); return
 
     if not (TEMP_MIN <= temp <= TEMP_MAX):
         log.error(f"ac_send_command: temp {temp} out of range"); return
-    if mode not in valid_modes:
+    if mode not in ("cool", "fan", "dry", "economy"):
         log.error(f"ac_send_command: unknown mode '{mode}'"); return
-    if fan not in valid_fans:
+    if fan not in ("auto", "high", "mid", "low"):
         log.error(f"ac_send_command: unknown fan '{fan}'"); return
     if power not in ("on", "off"):
         log.error(f"ac_send_command: unknown power '{power}'"); return
 
     try:
-        ir_code = make_tuya_code(temp, mode, fan, power, sweep)
+        ir_code = _make_tuya_code(temp, mode, fan, power, sweep)
     except ValueError as e:
         log.error(f"ac_send_command: {e}"); return
 
     payload_bytes = _make_payload(temp, mode, fan, power, sweep)
     log.info(
-        f"ac_send_command: power={power} {temp}°C {mode}/{fan} sweep={sweep} "
-        f"→ [{' '.join(f'{b:02X}' for b in payload_bytes)}]"
+        f"ac_send_command: [{room}] power={power} {temp}°C {mode}/{fan} "
+        f"→ [{' '.join(f'{b:02X}' for b in payload_bytes)}] → {topic}"
     )
-    mqtt.publish(
-        topic=IR_BLASTER_TOPIC,
-        payload=f'{{"ir_code_to_send":"{ir_code}"}}',
-    )
+    mqtt.publish(topic=topic, payload=f'{{"ir_code_to_send":"{ir_code}"}}')
 
 
 @service
-def ac_turn_off():
-    """
-    Power off the AC, preserving current mode/temp settings on the remote.
-    The AC will remember these settings for the next power-on.
-    """
-    temp = int(float(state.get("input_number.ac_temperature") or 25))
-    mode = state.get("input_select.ac_mode") or "cool"
-    fan  = state.get("input_select.ac_fan_speed") or "auto"
-    ac_send_command(temp=temp, mode=mode, fan=fan, power="off")
+def ac_turn_off(room="living"):
+    """Power off the AC in the given room."""
+    room = str(room).lower().strip()
+    try:
+        _get_topic(room)  # validate early
+    except ValueError as e:
+        log.error(f"ac_turn_off: {e}"); return
+
+    temp = int(float(_state_input(room, "input_number", "temperature", 25)))
+    mode = _state_input(room, "input_select", "mode", "cool")
+    fan  = _state_input(room, "input_select", "fan",  "auto")
+    ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="off")
 
 
 @service
-def ac_set_temperature(temp=25):
-    """Change temperature, keep current mode/fan."""
-    ac_send_command(
-        temp=temp,
-        mode=state.get("input_select.ac_mode") or "cool",
-        fan=state.get("input_select.ac_fan_speed") or "auto",
-        power="on",
-    )
+def ac_set_temperature(room="living", temp=25):
+    """Change temperature for a room, keep current mode/fan."""
+    room = str(room).lower().strip()
+    mode = _state_input(room, "input_select", "mode", "cool")
+    fan  = _state_input(room, "input_select", "fan",  "auto")
+    ac_send_command(room=room, temp=int(temp), mode=mode, fan=fan, power="on")
 
 
 @service
-def ac_set_mode(mode="cool"):
-    """Change mode, keep current temperature/fan."""
-    ac_send_command(
-        temp=int(float(state.get("input_number.ac_temperature") or 25)),
-        mode=mode,
-        fan=state.get("input_select.ac_fan_speed") or "auto",
-        power="on",
-    )
+def ac_set_mode(room="living", mode="cool"):
+    """Change mode for a room, keep current temperature/fan."""
+    room = str(room).lower().strip()
+    temp = int(float(_state_input(room, "input_number", "temperature", 25)))
+    fan  = _state_input(room, "input_select", "fan", "auto")
+    ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
 
 
 @service
-def ac_set_fan(fan="auto"):
-    """Change fan speed, keep current temperature/mode."""
-    ac_send_command(
-        temp=int(float(state.get("input_number.ac_temperature") or 25)),
-        mode=state.get("input_select.ac_mode") or "cool",
-        fan=fan,
-        power="on",
-    )
+def ac_set_fan(room="living", fan="auto"):
+    """Change fan speed for a room, keep current temperature/mode."""
+    room = str(room).lower().strip()
+    temp = int(float(_state_input(room, "input_number", "temperature", 25)))
+    mode = _state_input(room, "input_select", "mode", "cool")
+    ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
