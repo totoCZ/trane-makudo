@@ -2,13 +2,14 @@
 AC IR Code Generator
 ====================
 Generates Tuya-format IR codes for a Qunda-compatible split AC unit.
-Protocol reverse-engineered from captured IR blaster codes.
+Protocol fully reverse-engineered from Tuya Zigbee IR blaster captures.
 
 Usage:
-    python ac_ir_generator.py
     python ac_ir_generator.py --temp 24 --mode cool --fan auto
-    python ac_ir_generator.py --all          # print full code table
-    python ac_ir_generator.py --json         # output JSON map
+    python ac_ir_generator.py --temp 25 --mode economy
+    python ac_ir_generator.py --power off
+    python ac_ir_generator.py --all
+    python ac_ir_generator.py --json > codes.json
 """
 
 import base64
@@ -17,7 +18,7 @@ import argparse
 import json
 
 # ---------------------------------------------------------------------------
-# Protocol constants
+# Protocol constants (NEC-based IR timing)
 # ---------------------------------------------------------------------------
 
 HEADER_MARK  = 9000   # µs
@@ -27,7 +28,11 @@ ZERO_SPACE   = 576    # µs
 ONE_SPACE    = 1662   # µs
 FINAL_MARK   = 576    # µs
 
-# B1 high nibble encodes mode + fan speed together
+# B0 encodes power state in the low nibble, remote variant in the high nibble
+B0_ON  = 0x68   # power ON  (lo=8)
+B0_OFF = 0x60   # power OFF (lo=0)
+
+# B1 high nibble: encodes mode + fan speed
 MODE_FAN_NIBBLE = {
     ("fan",  "auto"): 0x0,
     ("fan",  "high"): 0x1,
@@ -47,17 +52,13 @@ MODE_FAN_NIBBLE = {
     ("heat", "low"):  0xF,   # inferred, untested
 }
 
-FAN_B6 = {
-    "auto": 0x07,
-    "high": 0x02,
-    "mid":  0x01,
-    "low":  0x00,
-}
+FAN_B6 = {"auto": 0x07, "high": 0x02, "mid": 0x01, "low": 0x00}
 
-VALID_MODES = ("cool", "fan", "dry", "heat")
-VALID_FANS  = ("auto", "high", "mid", "low")
-TEMP_MIN    = 16
-TEMP_MAX    = 30
+VALID_MODES  = ("cool", "fan", "dry", "heat", "economy")
+VALID_FANS   = ("auto", "high", "mid", "low")
+VALID_POWER  = ("on", "off")
+TEMP_MIN     = 16
+TEMP_MAX     = 30
 
 
 # ---------------------------------------------------------------------------
@@ -65,24 +66,45 @@ TEMP_MAX    = 30
 # ---------------------------------------------------------------------------
 
 def _nibsum(byte: int) -> int:
-    """Sum of the two nibbles of a byte."""
     return (byte >> 4) + (byte & 0x0F)
 
 
-def make_payload(temp_c: int, mode: str = "cool", fan: str = "auto") -> list[int]:
+def _compute_b5(b0: int, b1: int, b6: int, b7: int, target: int) -> int:
+    """Compute B5 so nibsum(B0,B1,B5,B6,B7) == target. Prefers lo nibble = 5."""
+    needed = target - _nibsum(b0) - _nibsum(b1) - _nibsum(b6) - _nibsum(b7)
+    if not (0 <= needed <= 30):
+        raise ValueError(
+            f"Cannot satisfy nibsum={target}: needed B5 nibsum={needed} "
+            f"(B0={b0:02X} B1={b1:02X} B6={b6:02X} B7={b7:02X})"
+        )
+    b5_lo = 5 if needed >= 5 else needed
+    b5_hi = needed - b5_lo
+    return (b5_hi << 4) | b5_lo
+
+
+def make_payload(
+    temp_c: int,
+    mode: str = "cool",
+    fan: str = "auto",
+    power: str = "on",
+    sweep: bool = True,
+) -> list[int]:
     """
     Build the 8-byte IR payload.
 
     Args:
         temp_c: Target temperature in Celsius (16–30).
-        mode:   AC mode — "cool", "fan", "dry", or "heat".
-        fan:    Fan speed — "auto", "high", "mid", or "low".
+        mode:   "cool", "fan", "dry", "heat", or "economy".
+        fan:    "auto", "high", "mid", or "low".
+                Ignored in economy mode (AC enforces quiet fan internally).
+        power:  "on" or "off". Controls B0 power bit.
+                OFF sends current settings with power-off flag — the AC
+                remembers the state for next power-on.
+        sweep:  Louver flag. Only meaningful for wall-mount units;
+                ducted units ignore it.
 
     Returns:
-        List of 8 integers (the raw payload bytes).
-
-    Raises:
-        ValueError: On out-of-range or unknown arguments.
+        List of 8 integers (raw payload bytes).
     """
     if not (TEMP_MIN <= temp_c <= TEMP_MAX):
         raise ValueError(f"Temperature {temp_c}°C out of range ({TEMP_MIN}–{TEMP_MAX})")
@@ -90,30 +112,26 @@ def make_payload(temp_c: int, mode: str = "cool", fan: str = "auto") -> list[int
         raise ValueError(f"Unknown mode '{mode}'. Valid: {VALID_MODES}")
     if fan not in VALID_FANS:
         raise ValueError(f"Unknown fan speed '{fan}'. Valid: {VALID_FANS}")
+    if power not in VALID_POWER:
+        raise ValueError(f"Unknown power state '{power}'. Valid: {VALID_POWER}")
 
-    key = (mode, fan)
-    if key not in MODE_FAN_NIBBLE:
-        raise ValueError(f"Unsupported mode/fan combination: {mode}/{fan}")
+    b0 = B0_ON if power == "on" else B0_OFF
 
-    b0 = 0x78
-    b1 = (MODE_FAN_NIBBLE[key] << 4) | (temp_c - 15)
-    b6 = FAN_B6[fan]
-    b7 = 0x0B - b6  # checksum: B6 + B7 = 0x0B always
-
-    # Nibble-sum checksum: total frame nibble sum must be 47 (cool/fan) or 63 (dry).
-    # Try target=47 first; fall back to 63 if B5_high would be out of [0, 15].
-    for target in (47, 63):
-        b5_high = target - _nibsum(b0) - _nibsum(b1) - _nibsum(b6) - _nibsum(b7) - 5
-        if 0 <= b5_high <= 15:
-            break
+    if mode == "economy":
+        b1 = 0x40 | (temp_c - 15)   # B1hi=4 (cool base), B1lo=temp nibble
+        b6 = 0x27                     # economy flag in hi nibble
+        b7 = 0x02 if sweep else 0x06  # bit 2 = louver off
+        target = 47
     else:
-        raise ValueError(
-            f"Cannot produce valid B5 for {temp_c}°C {mode}/{fan}. "
-            "This combination may not be supported."
-        )
+        key = (mode, fan)
+        if key not in MODE_FAN_NIBBLE:
+            raise ValueError(f"Unsupported mode/fan combination: {mode}/{fan}")
+        b1 = (MODE_FAN_NIBBLE[key] << 4) | (temp_c - 15)
+        b6 = FAN_B6[fan]
+        b7 = 0x0B - b6   # confirmed: B6 + B7 = 0x0B always
+        target = 63 if mode == "dry" else 47
 
-    b5 = (b5_high << 4) | 0x05  # low nibble is always 5
-
+    b5 = _compute_b5(b0, b1, b6, b7, target)
     return [b0, b1, 0x00, 0x00, 0x00, b5, b6, b7]
 
 
@@ -122,18 +140,15 @@ def make_payload(temp_c: int, mode: str = "cool", fan: str = "auto") -> list[int
 # ---------------------------------------------------------------------------
 
 def payload_to_durations(payload: list[int]) -> list[int]:
-    """
-    Convert 8-byte payload to a list of IR mark/space durations (µs).
-    Format: [header_mark, header_space, bit_mark, bit_space, ...., final_mark]
-    """
-    durations = [HEADER_MARK, HEADER_SPACE]
+    """Convert 8-byte payload to IR mark/space durations (µs). MSB first."""
+    d = [HEADER_MARK, HEADER_SPACE]
     for byte in payload:
-        for bit_idx in range(8):          # MSB first
+        for bit_idx in range(8):
             bit = (byte >> (7 - bit_idx)) & 1
-            durations.append(BIT_MARK)
-            durations.append(ONE_SPACE if bit else ZERO_SPACE)
-    durations.append(FINAL_MARK)
-    return durations
+            d.append(BIT_MARK)
+            d.append(ONE_SPACE if bit else ZERO_SPACE)
+    d.append(FINAL_MARK)
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -141,46 +156,33 @@ def payload_to_durations(payload: list[int]) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def _fastlz1_compress(data: bytes) -> bytes:
-    """Minimal FastLZ level-1 compressor (LZ77 variant, 8 kB window)."""
     output = bytearray()
     i = 0
     n = len(data)
-
     while i < n:
-        # Search for longest match in the look-back window
         best_len = 0
         best_off = 0
-        window_start = max(0, i - 8192)
-
-        for j in range(window_start, i):
+        ws = max(0, i - 8192)
+        for j in range(ws, i):
             ml = 0
             while (i + ml < n and ml < 264 and j + ml < i
                    and data[j + ml] == data[i + ml]):
                 ml += 1
             if ml >= 3 and ml > best_len:
-                best_len = ml
-                best_off = i - j - 1
-
+                best_len, best_off = ml, i - j - 1
         if best_len >= 3:
-            length = best_len - 2
-            if length < 7:
-                ctrl = (length << 5) | (best_off >> 8)
-            else:
-                ctrl = (7 << 5) | (best_off >> 8)
-            output.append(ctrl)
-            if length >= 7:
-                output.append(length - 7)
+            ln = best_len - 2
+            output.append(((min(ln, 7)) << 5) | (best_off >> 8))
+            if ln >= 7:
+                output.append(ln - 7)
             output.append(best_off & 0xFF)
             i += best_len
         else:
-            # Literal run (up to 32 bytes)
-            run_start = i
-            run_len = 0
-            while run_len < 32 and i < n:
-                # Stop early if a back-reference is available
+            rs = i
+            rl = 0
+            while rl < 32 and i < n:
                 found = False
-                ws = max(0, i - 8192)
-                for j in range(ws, i):
+                for j in range(max(0, i - 8192), i):
                     ml = 0
                     while (i + ml < n and ml < 264 and j + ml < i
                            and data[j + ml] == data[i + ml]):
@@ -188,13 +190,12 @@ def _fastlz1_compress(data: bytes) -> bytes:
                     if ml >= 3:
                         found = True
                         break
-                if found and run_len > 0:
+                if found and rl > 0:
                     break
-                run_len += 1
+                rl += 1
                 i += 1
-            output.append(run_len - 1)
-            output.extend(data[run_start:run_start + run_len])
-
+            output.append(rl - 1)
+            output.extend(data[rs:rs + rl])
     return bytes(output)
 
 
@@ -202,22 +203,22 @@ def _fastlz1_compress(data: bytes) -> bytes:
 # Public API
 # ---------------------------------------------------------------------------
 
-def make_tuya_code(temp_c: int, mode: str = "cool", fan: str = "auto") -> str:
+def make_tuya_code(
+    temp_c: int,
+    mode: str = "cool",
+    fan: str = "auto",
+    power: str = "on",
+    sweep: bool = True,
+) -> str:
     """
     Generate a Tuya-format IR code string for the given AC settings.
 
-    Args:
-        temp_c: Target temperature in Celsius (16–30).
-        mode:   "cool", "fan", "dry", or "heat".
-        fan:    "auto", "high", "mid", or "low".
-
     Returns:
-        Base64-encoded Tuya IR code string, ready to send via
-        zigbee2mqtt `ir_code_to_send` or Tuya local API.
+        Base64-encoded Tuya IR code, ready for zigbee2mqtt ir_code_to_send.
     """
-    payload   = make_payload(temp_c, mode, fan)
-    durations = payload_to_durations(payload)
-    raw       = struct.pack(f"<{len(durations)}H", *durations)
+    payload    = make_payload(temp_c, mode, fan, power, sweep)
+    durations  = payload_to_durations(payload)
+    raw        = struct.pack(f"<{len(durations)}H", *durations)
     compressed = _fastlz1_compress(raw)
     return base64.b64encode(compressed).decode()
 
@@ -227,18 +228,23 @@ def generate_all_codes() -> dict:
     Generate codes for all valid combinations.
 
     Returns:
-        Nested dict: codes[mode][fan][temp_c] = tuya_code_string
+        Nested dict: codes[power][mode][fan][temp_c] = tuya_code_string
     """
     codes = {}
-    for mode in VALID_MODES:
-        codes[mode] = {}
-        for fan in VALID_FANS:
-            codes[mode][fan] = {}
-            for temp in range(TEMP_MIN, TEMP_MAX + 1):
-                try:
-                    codes[mode][fan][temp] = make_tuya_code(temp, mode, fan)
-                except ValueError:
-                    pass  # skip unsupported combinations
+    for power in VALID_POWER:
+        codes[power] = {}
+        for mode in VALID_MODES:
+            codes[power][mode] = {}
+            fans = ["auto"] if mode == "economy" else VALID_FANS
+            for fan in fans:
+                codes[power][mode][fan] = {}
+                for temp in range(TEMP_MIN, TEMP_MAX + 1):
+                    try:
+                        codes[power][mode][fan][temp] = make_tuya_code(
+                            temp, mode, fan, power
+                        )
+                    except ValueError:
+                        pass
     return codes
 
 
@@ -250,16 +256,17 @@ def _cli():
     parser = argparse.ArgumentParser(
         description="Generate Tuya IR codes for a Qunda-compatible AC unit."
     )
-    parser.add_argument("--temp", type=int, default=25,
-                        help=f"Temperature in °C ({TEMP_MIN}–{TEMP_MAX}), default 25")
-    parser.add_argument("--mode", choices=VALID_MODES, default="cool",
-                        help="AC mode (default: cool)")
-    parser.add_argument("--fan", choices=VALID_FANS, default="auto",
-                        help="Fan speed (default: auto)")
-    parser.add_argument("--all", action="store_true",
+    parser.add_argument("--temp",  type=int, default=25,
+                        help=f"Temperature °C ({TEMP_MIN}–{TEMP_MAX}), default 25")
+    parser.add_argument("--mode",  choices=VALID_MODES, default="cool")
+    parser.add_argument("--fan",   choices=VALID_FANS, default="auto")
+    parser.add_argument("--power", choices=VALID_POWER, default="on")
+    parser.add_argument("--sweep", action=argparse.BooleanOptionalAction, default=True,
+                        help="Louver sweep (wall units only)")
+    parser.add_argument("--all",   action="store_true",
                         help="Print codes for every valid combination")
-    parser.add_argument("--json", action="store_true",
-                        help="Output all codes as JSON (implies --all)")
+    parser.add_argument("--json",  action="store_true",
+                        help="Output all codes as JSON")
     parser.add_argument("--payload", action="store_true",
                         help="Also show the raw 8-byte payload")
     args = parser.parse_args()
@@ -269,18 +276,20 @@ def _cli():
         if args.json:
             print(json.dumps(codes, indent=2))
         else:
-            for mode in VALID_MODES:
-                for fan in VALID_FANS:
-                    for temp in range(TEMP_MIN, TEMP_MAX + 1):
-                        code = codes.get(mode, {}).get(fan, {}).get(temp)
-                        if code:
-                            print(f"{temp}°C  {mode:4}  {fan:4}  {code}")
+            for power in VALID_POWER:
+                for mode in VALID_MODES:
+                    fans = ["auto"] if mode == "economy" else VALID_FANS
+                    for fan in fans:
+                        for temp in range(TEMP_MIN, TEMP_MAX + 1):
+                            code = codes.get(power,{}).get(mode,{}).get(fan,{}).get(temp)
+                            if code:
+                                print(f"{power:<3}  {temp}°C  {mode:<8}  {fan:<4}  {code}")
     else:
         try:
-            code = make_tuya_code(args.temp, args.mode, args.fan)
+            code = make_tuya_code(args.temp, args.mode, args.fan, args.power, args.sweep)
             print(f"Code: {code}")
             if args.payload:
-                p = make_payload(args.temp, args.mode, args.fan)
+                p = make_payload(args.temp, args.mode, args.fan, args.power, args.sweep)
                 print(f"Payload: {' '.join(f'{b:02X}' for b in p)}")
         except ValueError as e:
             print(f"Error: {e}")
