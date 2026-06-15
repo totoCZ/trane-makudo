@@ -23,8 +23,8 @@ import struct
 # Map room name → Zigbee2MQTT friendly name of that room's IR blaster.
 # Add as many rooms as you need.
 IR_BLASTERS = {
-    "living":  "zigbee2mqtt/ac_ir_blaster_living/set",
-    "bedroom": "zigbee2mqtt/ac_ir_blaster_bedroom/set",
+    "living":  "zigbee2mqtt/living_room_ir/set",
+    "bedroom": "zigbee2mqtt/bedroom_ir/set",
 }
 
 TEMP_MIN = 16
@@ -238,3 +238,126 @@ def ac_set_fan(room="living", fan="auto"):
     temp = int(float(_state_input(room, "input_number", "temperature", 25)))
     mode = _state_input(room, "input_select", "mode", "cool")
     ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
+
+
+# ── MQTT climate bridge ───────────────────────────────────────────────────────
+#
+# climate.living_room_ac / climate.bedroom_ac are proper MQTT climate entities
+# defined in packages/ac_control.yaml. Pyscript's role here is:
+#   1. Publish retained state to ha/ac/<room>/state on startup + helper changes
+#   2. Handle pyscript.ac_handle_cmd called by yaml automations when the MQTT
+#      climate entity sends a command to ha/ac/<room>/cmd/<field>
+
+import json as _json
+
+CLIMATE_ROOMS = {
+    "living": {
+        "temp_entity":  "input_number.ac_living_temperature",
+        "mode_entity":  "input_select.ac_living_mode",
+        "fan_entity":   "input_select.ac_living_fan",
+        "power_entity": "input_boolean.ac_living_power",
+        "temp_sensor":  "sensor.living_room_sensor_temperature",
+        "state_topic":  "ha/ac/living/state",
+    },
+    "bedroom": {
+        "temp_entity":  "input_number.ac_bedroom_temperature",
+        "mode_entity":  "input_select.ac_bedroom_mode",
+        "fan_entity":   "input_select.ac_bedroom_fan",
+        "power_entity": "input_boolean.ac_bedroom_power",
+        "temp_sensor":  "sensor.0xa4c13810c4936fde_temperature",
+        "state_topic":  "ha/ac/bedroom/state",
+    },
+}
+
+
+def _publish_state(room, cfg):
+    power    = state.get(cfg["power_entity"])
+    mode_val = state.get(cfg["mode_entity"]) or "cool"
+    fan_val  = state.get(cfg["fan_entity"])  or "auto"
+    temp_val = state.get(cfg["temp_entity"])
+    cur_raw  = state.get(cfg["temp_sensor"])
+
+    hvac_mode = "off" if power == "off" else ("fan_only" if mode_val == "fan" else mode_val)
+
+    try:
+        target_temp = float(temp_val) if temp_val else 25.0
+    except (ValueError, TypeError):
+        target_temp = 25.0
+
+    payload = {"mode": hvac_mode, "temperature": target_temp, "fan_mode": fan_val}
+    try:
+        if cur_raw not in (None, "unknown", "unavailable"):
+            payload["current_temperature"] = float(cur_raw)
+    except (ValueError, TypeError):
+        pass
+
+    mqtt.publish(topic=cfg["state_topic"], payload=_json.dumps(payload), retain=True)
+
+
+@time_trigger("startup")
+def ac_climate_startup():
+    for room, cfg in CLIMATE_ROOMS.items():
+        _publish_state(room, cfg)
+    log.info("ac_climate: MQTT state published")
+
+
+@state_trigger(
+    "input_boolean.ac_living_power",
+    "input_select.ac_living_mode",
+    "input_select.ac_living_fan",
+    "input_number.ac_living_temperature",
+    "sensor.living_room_sensor_temperature",
+)
+def ac_living_sync(**kwargs):
+    _publish_state("living", CLIMATE_ROOMS["living"])
+
+
+@state_trigger(
+    "input_boolean.ac_bedroom_power",
+    "input_select.ac_bedroom_mode",
+    "input_select.ac_bedroom_fan",
+    "input_number.ac_bedroom_temperature",
+    "sensor.0xa4c13810c4936fde_temperature",
+)
+def ac_bedroom_sync(**kwargs):
+    _publish_state("bedroom", CLIMATE_ROOMS["bedroom"])
+
+
+@service
+def ac_handle_cmd(room="living", cmd="mode", value="off"):
+    """Called by yaml automations when the MQTT climate entity sends a command."""
+    room = str(room).lower().strip()
+    cfg  = CLIMATE_ROOMS.get(room)
+    if not cfg:
+        log.error(f"ac_handle_cmd: unknown room '{room}'"); return
+
+    temp  = int(float(state.get(cfg["temp_entity"]) or 25))
+    mode  = state.get(cfg["mode_entity"]) or "cool"
+    fan   = state.get(cfg["fan_entity"])  or "auto"
+    power = state.get(cfg["power_entity"]) or "off"
+
+    if cmd == "mode":
+        hvac_mode = str(value).strip()
+        if hvac_mode == "off":
+            input_boolean.turn_off(entity_id=cfg["power_entity"])
+            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="off")
+        else:
+            ir_mode = "fan" if hvac_mode == "fan_only" else hvac_mode
+            input_boolean.turn_on(entity_id=cfg["power_entity"])
+            input_select.select_option(entity_id=cfg["mode_entity"], option=ir_mode)
+            mode = ir_mode
+            ac_send_command(room=room, temp=temp, mode=ir_mode, fan=fan, power="on")
+
+    elif cmd == "temperature":
+        temp = int(float(value))
+        input_number.set_value(entity_id=cfg["temp_entity"], value=float(temp))
+        if power == "on":
+            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
+
+    elif cmd == "fan_mode":
+        fan = str(value).strip()
+        input_select.select_option(entity_id=cfg["fan_entity"], option=fan)
+        if power == "on":
+            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
+
+    _publish_state(room, cfg)
