@@ -44,14 +44,14 @@ B0_OFF = 0x60
 
 MODE_FAN_NIBBLE = {
     ("fan",  "auto"): 0x0, ("fan",  "high"): 0x1,
-    ("fan",  "mid"):  0x2, ("fan",  "low"):  0x3,
+    ("fan",  "medium"):  0x2, ("fan",  "low"):  0x3,
     ("cool", "auto"): 0x4, ("cool", "high"): 0x5,
-    ("cool", "mid"):  0x6, ("cool", "low"):  0x7,
+    ("cool", "medium"):  0x6, ("cool", "low"):  0x7,
     ("dry",  "auto"): 0x8, ("dry",  "high"): 0x9,
-    ("dry",  "mid"):  0xA, ("dry",  "low"):  0xB,
+    ("dry",  "medium"):  0xA, ("dry",  "low"):  0xB,
 }
 
-FAN_B6 = {"auto": 0x07, "high": 0x02, "mid": 0x01, "low": 0x00}
+FAN_B6 = {"auto": 0x07, "high": 0x02, "medium": 0x01, "low": 0x00}
 
 # ── Core generator ────────────────────────────────────────────────────────────
 
@@ -156,7 +156,7 @@ def ac_send_command(room="living", temp=25, mode="cool", fan="auto", power="on",
     room  : str   Room name — must match a key in IR_BLASTERS.
     temp  : int   Temperature °C (16–30).
     mode  : str   cool | fan | dry | economy
-    fan   : str   auto | high | mid | low
+    fan   : str   auto | high | medium | low
     power : str   on | off
     sweep : bool  Louver flag (wall units only; ducted ignores it).
     """
@@ -180,7 +180,7 @@ def ac_send_command(room="living", temp=25, mode="cool", fan="auto", power="on",
         log.error(f"ac_send_command: temp {temp} out of range"); return
     if mode not in ("cool", "fan", "dry", "economy"):
         log.error(f"ac_send_command: unknown mode '{mode}'"); return
-    if fan not in ("auto", "high", "mid", "low"):
+    if fan not in ("auto", "high", "medium", "low"):
         log.error(f"ac_send_command: unknown fan '{fan}'"); return
     if power not in ("on", "off"):
         log.error(f"ac_send_command: unknown power '{power}'"); return
