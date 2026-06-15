@@ -85,46 +85,45 @@ input_boolean:
 # State is published to retained topics by pyscript on startup
 # and whenever input_* helpers change.
 
-climate:
-  - platform: mqtt
-    name: "Living Room AC"
-    unique_id: ac_living_room
-    modes: ["off", "cool", "fan_only", "dry"]
-    fan_modes: ["auto", "high", "mid", "low"]
-    min_temp: 16
-    max_temp: 30
-    temp_step: 1
-    mode_state_topic: "ha/ac/living/state"
-    mode_state_template: "{{ value_json.mode }}"
-    temperature_state_topic: "ha/ac/living/state"
-    temperature_state_template: "{{ value_json.temperature }}"
-    fan_mode_state_topic: "ha/ac/living/state"
-    fan_mode_state_template: "{{ value_json.fan_mode }}"
-    current_temperature_topic: "ha/ac/living/state"
-    current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
-    mode_command_topic: "ha/ac/living/cmd/mode"
-    temperature_command_topic: "ha/ac/living/cmd/temperature"
-    fan_mode_command_topic: "ha/ac/living/cmd/fan_mode"
+mqtt:
+  climate:
+    - name: "Living Room AC"
+      unique_id: ac_living_room
+      modes: ["off", "cool", "fan_only", "dry"]
+      fan_modes: ["auto", "high", "mid", "low"]
+      min_temp: 16
+      max_temp: 30
+      temp_step: 1
+      mode_state_topic: "ha/ac/living/state"
+      mode_state_template: "{{ value_json.mode }}"
+      temperature_state_topic: "ha/ac/living/state"
+      temperature_state_template: "{{ value_json.temperature }}"
+      fan_mode_state_topic: "ha/ac/living/state"
+      fan_mode_state_template: "{{ value_json.fan_mode }}"
+      current_temperature_topic: "ha/ac/living/state"
+      current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
+      mode_command_topic: "ha/ac/living/cmd/mode"
+      temperature_command_topic: "ha/ac/living/cmd/temperature"
+      fan_mode_command_topic: "ha/ac/living/cmd/fan_mode"
 
-  - platform: mqtt
-    name: "Bedroom AC"
-    unique_id: ac_bedroom
-    modes: ["off", "cool", "fan_only", "dry"]
-    fan_modes: ["auto", "high", "mid", "low"]
-    min_temp: 16
-    max_temp: 30
-    temp_step: 1
-    mode_state_topic: "ha/ac/bedroom/state"
-    mode_state_template: "{{ value_json.mode }}"
-    temperature_state_topic: "ha/ac/bedroom/state"
-    temperature_state_template: "{{ value_json.temperature }}"
-    fan_mode_state_topic: "ha/ac/bedroom/state"
-    fan_mode_state_template: "{{ value_json.fan_mode }}"
-    current_temperature_topic: "ha/ac/bedroom/state"
-    current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
-    mode_command_topic: "ha/ac/bedroom/cmd/mode"
-    temperature_command_topic: "ha/ac/bedroom/cmd/temperature"
-    fan_mode_command_topic: "ha/ac/bedroom/cmd/fan_mode"
+    - name: "Bedroom AC"
+      unique_id: ac_bedroom
+      modes: ["off", "cool", "fan_only", "dry"]
+      fan_modes: ["auto", "high", "mid", "low"]
+      min_temp: 16
+      max_temp: 30
+      temp_step: 1
+      mode_state_topic: "ha/ac/bedroom/state"
+      mode_state_template: "{{ value_json.mode }}"
+      temperature_state_topic: "ha/ac/bedroom/state"
+      temperature_state_template: "{{ value_json.temperature }}"
+      fan_mode_state_topic: "ha/ac/bedroom/state"
+      fan_mode_state_template: "{{ value_json.fan_mode }}"
+      current_temperature_topic: "ha/ac/bedroom/state"
+      current_temperature_template: "{{ value_json.current_temperature | default(none, true) }}"
+      mode_command_topic: "ha/ac/bedroom/cmd/mode"
+      temperature_command_topic: "ha/ac/bedroom/cmd/temperature"
+      fan_mode_command_topic: "ha/ac/bedroom/cmd/fan_mode"
 
 
 # ── Automations — bridge MQTT command topics → pyscript ─────────
