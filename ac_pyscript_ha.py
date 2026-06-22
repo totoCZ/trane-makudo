@@ -329,33 +329,34 @@ def ac_handle_cmd(room="living", cmd="mode", value="off"):
     if not cfg:
         log.error(f"ac_handle_cmd: unknown room '{room}'"); return
 
+    # Apply the state change to input helpers immediately
+    if cmd == "mode":
+        hvac_mode = str(value).strip()
+        if hvac_mode == "off":
+            input_boolean.turn_off(entity_id=cfg["power_entity"])
+        else:
+            ir_mode = "fan" if hvac_mode == "fan_only" else hvac_mode
+            input_boolean.turn_on(entity_id=cfg["power_entity"])
+            input_select.select_option(entity_id=cfg["mode_entity"], option=ir_mode)
+
+    elif cmd == "temperature":
+        temp = int(float(value))
+        input_number.set_value(entity_id=cfg["temp_entity"], value=float(temp))
+
+    elif cmd == "fan_mode":
+        fan = str(value).strip()
+        input_select.select_option(entity_id=cfg["fan_entity"], option=fan)
+
+    # Debounce: cancel any pending IR send for this room, then wait.
+    # If mode + temperature arrive simultaneously, only the last one sends IR.
+    task.unique(f"ac_ir_send_{room}")
+    task.sleep(0.6)
+
+    # Re-read state after debounce window — picks up all simultaneous updates
     temp  = int(float(state.get(cfg["temp_entity"]) or 25))
     mode  = state.get(cfg["mode_entity"]) or "cool"
     fan   = state.get(cfg["fan_entity"])  or "auto"
     power = state.get(cfg["power_entity"]) or "off"
 
-    if cmd == "mode":
-        hvac_mode = str(value).strip()
-        if hvac_mode == "off":
-            input_boolean.turn_off(entity_id=cfg["power_entity"])
-            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="off")
-        else:
-            ir_mode = "fan" if hvac_mode == "fan_only" else hvac_mode
-            input_boolean.turn_on(entity_id=cfg["power_entity"])
-            input_select.select_option(entity_id=cfg["mode_entity"], option=ir_mode)
-            mode = ir_mode
-            ac_send_command(room=room, temp=temp, mode=ir_mode, fan=fan, power="on")
-
-    elif cmd == "temperature":
-        temp = int(float(value))
-        input_number.set_value(entity_id=cfg["temp_entity"], value=float(temp))
-        if power == "on":
-            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
-
-    elif cmd == "fan_mode":
-        fan = str(value).strip()
-        input_select.select_option(entity_id=cfg["fan_entity"], option=fan)
-        if power == "on":
-            ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power="on")
-
+    ac_send_command(room=room, temp=temp, mode=mode, fan=fan, power=power)
     _publish_state(room, cfg)
